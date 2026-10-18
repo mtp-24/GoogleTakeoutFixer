@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -42,6 +43,31 @@ var (
 	logFile   *os.File
 )
 
+// LogDirectory returns the folder the detailed log files are written to. The app used to write
+// into a "logs" folder relative to the working directory, which ends up in random places when
+// the app is started by double-clicking it
+func LogDirectory() string {
+	if runtime.GOOS == "darwin" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Logs", "GoogleTakeoutFixer")
+		}
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "GoogleTakeoutFixer", "logs")
+	}
+	return "logs"
+}
+
+// LogFilePath returns the path of the current log file, or "" if none is open
+func LogFilePath() string {
+	logFileMu.Lock()
+	defer logFileMu.Unlock()
+	if logFile == nil {
+		return ""
+	}
+	return logFile.Name()
+}
+
 func InitializeFileLogger() error {
 	logFileMu.Lock()
 	defer logFileMu.Unlock()
@@ -51,12 +77,13 @@ func InitializeFileLogger() error {
 		logFile = nil
 	}
 
-	if err := os.MkdirAll("logs", 0o755); err != nil {
+	logDir := LogDirectory()
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return err
 	}
 
 	fileName := fmt.Sprintf("%s.txt", time.Now().Format("2006-01-02_15-04-05"))
-	filePath := filepath.Join("logs", fileName)
+	filePath := filepath.Join(logDir, fileName)
 
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
