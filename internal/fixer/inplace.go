@@ -22,9 +22,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -107,7 +109,8 @@ func undoMetadata(entry JournalEntry) error {
 		}
 	}
 
-	args := []string{"-overwrite_original", "-E", "-n", "-sep", "||", "-charset", "filename=utf8", "-m"}
+	// No -m here: ignoring minor errors would let exiftool delete trailing data it does not understand
+	args := []string{"-overwrite_original", "-E", "-n", "-sep", "||", "-charset", "filename=utf8"}
 	for _, tag := range entry.Added {
 		if _, existed := entry.Before[tag]; !existed {
 			args = append(args, "-"+tag+"=")
@@ -123,7 +126,7 @@ func undoMetadata(entry JournalEntry) error {
 	}
 
 	// Nothing but file dates changed: no need to touch the file's content
-	if len(args) > 8 {
+	if len(args) > 7 {
 		exifToolMutex.Lock()
 		_, err := runExifTool(append(args, entry.Path))
 		exifToolMutex.Unlock()
@@ -366,6 +369,7 @@ func fixFileInPlace(fixerCtx *FixerContext, journal *Journal, path string) error
 	if writeErr != nil {
 		fixerCtx.Stats.MetadataFailed.Add(1)
 		Log(LoggerError, "Failed to apply metadata to %s: %v", path, writeErr)
+		explainMinorError(writeErr)
 		if !utcTime.IsZero() {
 			if dateErr := SetFileDates(path, utcTime); dateErr != nil {
 				Log(LoggerError, "Failed to set file dates of %s: %v", path, dateErr)
@@ -402,4 +406,202 @@ func expectedWallClock(args []string) string {
 		}
 	}
 	return ""
+}
+
+// Coordinates Google exports are rounded to four decimals, about 11 metres. A camera's own
+// coordinates are more precise, so an existing location this close to Google's is kept
+const sameLocationMetres = 15.0
+
+// Rough distance in metres between two coordinates, good enough to tell rounding from a move
+func distanceMetres(lat1, lon1, lat2, lon2 float64) float64 {
+	dLat := (lat2 - lat1) * 111000
+	dLon := (lon2 - lon1) * 111000 * math.Cos(lat1*math.Pi/180)
+	return math.Sqrt(dLat*dLat + dLon*dLon)
+}
+
+// Signed latitude and longitude from a tag snapshot taken with -n, from whichever GPS tags the file has
+func locationFromSnapshot(tags map[string]string) (float64, float64, bool) {
+	if coords, ok := tags["Keys:GPSCoordinates"]; ok {
+		if lat, lon, ok := parseCoordinates(coords); ok {
+			return lat, lon, true
+		}
+	}
+	if coords, ok := tags["UserData:GPSCoordinates"]; ok {
+		if lat, lon, ok := parseCoordinates(coords); ok {
+			return lat, lon, true
+		}
+	}
+	for _, group := range []string{"GPS", "XMP-exif"} {
+		lat, errLat := strconv.ParseFloat(tags[group+":GPSLatitude"], 64)
+		lon, errLon := strconv.ParseFloat(tags[group+":GPSLongitude"], 64)
+		if errLat != nil || errLon != nil {
+			continue
+		}
+		// EXIF stores unsigned values with a hemisphere. With -n the reference is "S"/"W" or "N"/"E"
+		if ref := tags[group+":GPSLatitudeRef"]; ref == "S" || ref == "South" {
+			lat = -math.Abs(lat)
+		}
+		if ref := tags[group+":GPSLongitudeRef"]; ref == "W" || ref == "West" {
+			lon = -math.Abs(lon)
+		}
+		return lat, lon, true
+	}
+	return 0, 0, false
+}
+
+// Parses "lat lon [alt]" as exiftool prints QuickTime coordinates with -n
+func parseCoordinates(coords string) (float64, float64, bool) {
+	parts := strings.Fields(coords)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	lat, errLat := strconv.ParseFloat(parts[0], 64)
+	lon, errLon := strconv.ParseFloat(parts[1], 64)
+	return lat, lon, errLat == nil && errLon == nil
+}
+
+// Reads the location a file has right now, signed
+func readExistingLocation(filePath string) (float64, float64, bool) {
+	exifToolMutex.Lock()
+	defer exifToolMutex.Unlock()
+
+	if exifToolCmd == nil {
+		return 0, 0, false
+	}
+	lines, err := runExifTool([]string{"-n", "-s3", "-f", "-Composite:GPSLatitude", "-Composite:GPSLongitude", "-charset", "filename=utf8", filePath})
+	if err != nil || len(lines) < 2 {
+		return 0, 0, false
+	}
+	lat, errLat := strconv.ParseFloat(strings.TrimSpace(lines[0]), 64)
+	lon, errLon := strconv.ParseFloat(strings.TrimSpace(lines[1]), 64)
+	return lat, lon, errLat == nil && errLon == nil
+}
+
+// RestoreGPS puts the coordinates a file had before an in-place run back, using that run's journal,
+// for every file whose location Google had only rounded (within maxMetres). Files whose location
+// was really changed in Google Photos keep Google's. The restore is journaled like any other run
+func RestoreGPS(journalPath string, maxMetres float64, dryRun bool) error {
+	entries, err := ReadJournal(journalPath)
+	if err != nil {
+		return err
+	}
+	finish := startRun("restoring GPS precision", journalPath, filepath.Dir(journalPath))
+	defer finish()
+
+	if err := InitializeExifTool(); err != nil {
+		return err
+	}
+	defer CloseExifTool()
+
+	var journal *Journal
+	if !dryRun {
+		journal, err = OpenJournal(filepath.Dir(journalPath), "metadata")
+		if err != nil {
+			return err
+		}
+		defer journal.Close()
+		Log(LoggerInfo, "Journal for undoing this run: %s", journal.Path)
+	}
+
+	restored, kept, unchanged, failed := 0, 0, 0, 0
+	for _, entry := range entries {
+		if entry.Op != "metadata" {
+			continue
+		}
+		var gpsBefore []string
+		for tag := range entry.Before {
+			if strings.Contains(tag, "GPS") {
+				gpsBefore = append(gpsBefore, tag)
+			}
+		}
+		var gpsAdded []string
+		for _, tag := range entry.Added {
+			if strings.Contains(tag, "GPS") {
+				gpsAdded = append(gpsAdded, tag)
+			}
+		}
+		if len(gpsBefore) == 0 {
+			continue
+		}
+		sort.Strings(gpsBefore)
+		sort.Strings(gpsAdded)
+
+		current, err := snapshotTags(entry.Path)
+		if err != nil {
+			failed++
+			Log(LoggerError, "Could not read %s: %v", entry.Path, err)
+			continue
+		}
+		curLat, curLon, hasCurrent := locationFromSnapshot(current)
+
+		// The location before the run: the journaled tags, filled up with the unchanged ones
+		previous := map[string]string{}
+		for tag, value := range current {
+			previous[tag] = value
+		}
+		for _, tag := range gpsAdded {
+			delete(previous, tag)
+		}
+		for _, tag := range gpsBefore {
+			previous[tag] = entry.Before[tag]
+		}
+		prevLat, prevLon, hasPrevious := locationFromSnapshot(previous)
+
+		if hasCurrent && hasPrevious {
+			if distance := distanceMetres(prevLat, prevLon, curLat, curLon); distance > maxMetres {
+				kept++
+				Log(LoggerInfo, "Keeping Google's location for %s, it is %.0f m from the original (%f, %f -> %f, %f)", entry.Path, distance, prevLat, prevLon, curLat, curLon)
+				continue
+			}
+		}
+
+		args := []string{"-overwrite_original", "-E", "-n", "-sep", "||", "-charset", "filename=utf8"}
+		for _, tag := range gpsAdded {
+			args = append(args, "-"+tag+"=")
+		}
+		for _, tag := range gpsBefore {
+			args = append(args, "-"+tag+"="+escapeExifValue(entry.Before[tag]))
+		}
+
+		if dryRun {
+			restored++
+			Log(LoggerInfo, "[dry-run] Would restore %s on %s", strings.Join(append(gpsBefore, gpsAdded...), ", "), entry.Path)
+			continue
+		}
+
+		modTime := modTimeOf(entry.Path)
+		exifToolMutex.Lock()
+		_, writeErr := runExifTool(append(args, entry.Path))
+		exifToolMutex.Unlock()
+		if writeErr != nil {
+			failed++
+			Log(LoggerError, "Could not restore GPS of %s: %v", entry.Path, writeErr)
+			continue
+		}
+		// The write changes the modification time, the dates of the run stay
+		if err := os.Chtimes(entry.Path, modTime, modTime); err != nil {
+			Log(LoggerWarn, "Could not keep the modification time of %s: %v", entry.Path, err)
+		}
+
+		after, _ := snapshotTags(entry.Path)
+		change := changedTags(entry.Path, current, after, modTime, "")
+		if len(change.Before) == 0 && len(change.Added) == 0 {
+			unchanged++
+		} else if err := journal.Record(change); err != nil {
+			return err
+		}
+		restored++
+	}
+
+	if dryRun {
+		Log(LoggerInfo, "Dry run: nothing was changed, the summary shows what would happen")
+	}
+	Log(LoggerInfo, "Summary: original GPS coordinates restored on %d files (%d of them turned out identical), Google's location kept on %d files that were moved further than %.0f m", restored, unchanged, kept, maxMetres)
+	if failed > 0 {
+		Log(LoggerError, "Summary: %d files could not be processed, see the log", failed)
+	}
+	if journal != nil {
+		Log(LoggerInfo, "To undo this run: --undo \"%s\"", journal.Path)
+	}
+	return nil
 }

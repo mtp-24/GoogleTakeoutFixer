@@ -100,13 +100,8 @@ func (fixerCtx *FixerContext) ClaimDestPath(destPath string, sourcePath string) 
 		fixerCtx.claimedPaths = make(map[string]string)
 	}
 
-	ext := filepath.Ext(destPath)
-	base := strings.TrimSuffix(destPath, ext)
 	for i := 0; ; i++ {
-		candidate := destPath
-		if i > 0 {
-			candidate = fmt.Sprintf("%s(%d)%s", base, i, ext)
-		}
+		candidate := filepath.Join(filepath.Dir(destPath), NameWithCounter(filepath.Base(destPath), i))
 
 		// Lowercase keys because file systems like APFS and NTFS are case insensitive
 		key := strings.ToLower(candidate)
@@ -713,6 +708,7 @@ func CreateFixedFile(
 			if err != nil {
 				fixerCtx.Stats.MetadataFailed.Add(1)
 				Log(LoggerError, "Failed to apply metadata to %s: %v", destPath, err)
+				explainMinorError(err)
 
 				// At least give the file the right dates, so it does not show up as taken today
 				if takenTime, timeErr := TakenTime(metadata); timeErr == nil {

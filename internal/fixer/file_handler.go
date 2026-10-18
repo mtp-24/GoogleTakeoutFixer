@@ -243,6 +243,17 @@ type mediaName struct {
 	index int    // duplicate counter, 0 if there is none
 }
 
+// Gives a file name the n-th duplicate counter: "IMG_0001.jpg" -> "IMG_0001(1).jpg". A name that
+// already carries a counter continues counting instead of stacking: "IMG_0001(1).jpg" -> "IMG_0001(2).jpg"
+func NameWithCounter(fileName string, n int) string {
+	if n <= 0 {
+		return fileName
+	}
+	ext := filepath.Ext(fileName)
+	stem, existing := splitDuplicateCounter(strings.TrimSuffix(fileName, ext))
+	return fmt.Sprintf("%s(%d)%s", stem, existing+n, ext)
+}
+
 // Removes a trailing "(n)" duplicate counter and returns it, or 0 if there is none.
 // Google's counters start at 1, a "(0)" is part of the name (e.g. Samsung burst photos)
 func splitDuplicateCounter(s string) (string, int) {
@@ -506,25 +517,57 @@ func pickSidecar(mediaPath string, matches []sidecarMatch) string {
 // name without counter and edited suffix, and for edited copies and live photo videos with a
 // counter the sidecar of the original photo, because Google does not always export a sidecar
 // for those (same photo, same date)
-func sidecarCandidates(fileName string) []mediaName {
+func sidecarCandidates(fileName string) []sidecarCandidate {
 	parts := splitName(fileName)
 	media := parseMediaName(fileName)
 
 	literal := mediaName{name: parts.lower, base: strings.TrimSuffix(parts.lower, parts.ext)}
-	candidates := []mediaName{literal}
+	candidates := []sidecarCandidate{{name: literal}}
 	if parts.edited && parts.trailing > 0 {
 		// Google may have exported "IMG_0001-edited.jpg(1).json" for the second edited copy
-		candidates = append(candidates, mediaName{name: parts.stemNoCounter + parts.ext, base: parts.stemNoCounter, index: parts.trailing})
+		candidates = append(candidates, sidecarCandidate{name: mediaName{name: parts.stemNoCounter + parts.ext, base: parts.stemNoCounter, index: parts.trailing}})
 	}
 	if media != literal {
-		candidates = append(candidates, media)
+		candidates = append(candidates, sidecarCandidate{name: media})
 	}
 	if media.index > 0 && IsVideoFile(fileName) {
-		// "IMG_0001(1).MP4" is usually the second live photo video of IMG_0001, not a video of IMG_0001(1)
-		candidates = append(candidates, mediaName{name: media.name, base: media.base})
+		// "IMG_0001(1).MP4" is usually the second live photo video of IMG_0001, not a video of IMG_0001(1).
+		// That is a guess, so a match through this candidate is checked against the file's own metadata
+		candidates = append(candidates, sidecarCandidate{name: mediaName{name: media.name, base: media.base}, guess: true})
 	}
 
 	return candidates
+}
+
+// A name a sidecar may have for a media file. guess marks the candidates that assume a relation
+// Google's naming does not guarantee
+type sidecarCandidate struct {
+	name  mediaName
+	guess bool
+}
+
+// Compares a sidecar found through a guess with what the media file says about itself and warns
+// when they clearly describe different moments or places. The sidecar is still used, because the
+// file's own metadata is often an export time or the location of a later re-upload
+func warnIfSidecarDisagrees(mediaPath string, sidecarPath string) {
+	metadata, err := ReadJsonMetadata(sidecarPath)
+	if err != nil {
+		return
+	}
+	if fileDate, ok := ReadExifDate(mediaPath); ok {
+		if taken, err := TakenTime(metadata); err == nil {
+			if days := fileDate.Sub(taken).Abs().Hours() / 24; days > 1 {
+				Log(LoggerWarn, "%s uses the sidecar of its photo, but its own date (%s) is %.0f days from the sidecar's (%s). Please check this file", mediaPath, fileDate.Format("2006-01-02"), days, taken.Local().Format("2006-01-02"))
+			}
+		}
+	}
+	if geo := metadata.location(); geo.hasLocation() {
+		if lat, lon, ok := readExistingLocation(mediaPath); ok {
+			if km := distanceMetres(lat, lon, geo.Latitude, geo.Longitude) / 1000; km > 50 {
+				Log(LoggerWarn, "%s uses the sidecar of its photo, but its own location is %.0f km from the sidecar's. Please check this file", mediaPath, km)
+			}
+		}
+	}
 }
 
 // Find a matching sidecar JSON in the directory of the media file
@@ -546,7 +589,7 @@ func FindSidecarInExcluding(dirs []string, mediaPath string, exclude map[string]
 	candidates := sidecarCandidates(filepath.Base(mediaPath))
 
 	for _, exactOnly := range []bool{true, false} {
-		for _, media := range candidates {
+		for _, candidate := range candidates {
 			var matches []sidecarMatch
 			for _, dir := range dirs {
 				entries, err := ReadDirCached(dir)
@@ -556,13 +599,16 @@ func FindSidecarInExcluding(dirs []string, mediaPath string, exclude map[string]
 					}
 					return "", err
 				}
-				for _, match := range matchSidecars(dir, entries, media, exactOnly) {
+				for _, match := range matchSidecars(dir, entries, candidate.name, exactOnly) {
 					if !exclude[match.path] {
 						matches = append(matches, match)
 					}
 				}
 			}
 			if path := pickSidecar(mediaPath, matches); path != "" {
+				if candidate.guess {
+					warnIfSidecarDisagrees(mediaPath, path)
+				}
 				return path, nil
 			}
 		}

@@ -142,13 +142,8 @@ func (org *organizer) move(from string, to string) error {
 
 // Returns a path in dir for the file name that does not exist yet, adding "(n)" if needed
 func (org *organizer) freePath(dir string, fileName string) string {
-	ext := filepath.Ext(fileName)
-	stem := strings.TrimSuffix(fileName, ext)
 	for n := 0; ; n++ {
-		candidate := filepath.Join(dir, fileName)
-		if n > 0 {
-			candidate = filepath.Join(dir, fmt.Sprintf("%s(%d)%s", stem, n, ext))
-		}
+		candidate := filepath.Join(dir, NameWithCounter(fileName, n))
 		if _, exists := org.exists(candidate); !exists {
 			return candidate
 		}
@@ -196,11 +191,7 @@ type plannedMove struct {
 
 // Name with the group's counter, e.g. "IMG_0001(1).HEIC"
 func (pm plannedMove) nameWithCounter(n int) string {
-	if n == 0 {
-		return pm.name
-	}
-	ext := filepath.Ext(pm.name)
-	return fmt.Sprintf("%s(%d)%s", strings.TrimSuffix(pm.name, ext), n, ext)
+	return NameWithCounter(pm.name, n)
 }
 
 // Organize moves the media files and sidecars of one or more takeout archives into a single

@@ -378,3 +378,22 @@ func TestZeroCounterIsPartOfTheName(t *testing.T) {
 		}
 	}
 }
+
+func TestNameWithCounter(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+		want string
+	}{
+		{"IMG_0001.jpg", 0, "IMG_0001.jpg"},
+		{"IMG_0001.jpg", 1, "IMG_0001(1).jpg"},
+		{"IMG_0001(1).jpg", 1, "IMG_0001(2).jpg"}, // continues instead of "(1)(1)"
+		{"IMG_0001(3).HEIC", 2, "IMG_0001(5).HEIC"},
+		{"FullSizeRender(1).heic", 1, "FullSizeRender(2).heic"},
+	}
+	for _, test := range tests {
+		if got := NameWithCounter(test.name, test.n); got != test.want {
+			t.Errorf("NameWithCounter(%q, %d) = %q; want %q", test.name, test.n, got, test.want)
+		}
+	}
+}

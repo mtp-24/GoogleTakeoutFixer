@@ -52,6 +52,8 @@ func Main() {
 	inPlace := flag.Bool("in-place", false, "Write the metadata into the files in --input where they are, without copying them. Writes a journal for --undo")
 	keepBackups := flag.Bool("keep-backups", false, "With --in-place: keep exiftool's \"_original\" copies so --undo restores the exact original files (needs disk space)")
 	undo := flag.String("undo", "", "Undo a previous --organize or --in-place run using its journal file")
+	restoreGPS := flag.String("restore-gps", "", "Put the GPS coordinates files had before an --in-place run back where Google had only rounded them, using that run's journal file")
+	maxGPSShift := flag.Float64("max-gps-shift", 15, "With --restore-gps: coordinates that moved further than this many metres are treated as corrected in Google Photos and kept")
 
 	flag.Parse()
 
@@ -63,6 +65,13 @@ func Main() {
 	if *undo != "" {
 		if err := fixer.Undo(*undo); err != nil {
 			fmt.Printf("Error during undo: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *restoreGPS != "" {
+		if err := fixer.RestoreGPS(*restoreGPS, *maxGPSShift, *dryRun); err != nil {
+			fmt.Printf("Error restoring GPS: %v\n", err)
 			os.Exit(1)
 		}
 		return

@@ -384,6 +384,14 @@ func metadataArgs(filePath string, originalName string, meta imageMetadata) ([]s
 		args = append(args, "-Rating=5")
 	}
 
+	// A camera's own coordinates are more precise than Google's rounded ones, so a location that
+	// Google only rounded is left as it is
+	if geo.hasLocation() {
+		if lat, lon, ok := readExistingLocation(filePath); ok && distanceMetres(lat, lon, geo.Latitude, geo.Longitude) <= sameLocationMetres {
+			geo = geoData{}
+		}
+	}
+
 	// EXIF uses N E S W for geodata
 	if geo.hasLocation() {
 		lat, lon := geo.Latitude, geo.Longitude
@@ -445,6 +453,15 @@ func ApplyMetadata(filePath string, originalName string, meta imageMetadata) err
 	}
 
 	return nil
+}
+
+// Exiftool refuses to write files with unexpected data after the last known structure, e.g. the
+// motion detector trailer some Samsung videos carry. Forcing the write (-m) would delete that data,
+// so the embedded metadata is left alone and only the file dates are set
+func explainMinorError(err error) {
+	if err != nil && strings.Contains(err.Error(), "[minor]") {
+		Log(LoggerInfo, "Exiftool would have to delete data at the end of the file to write it, so its embedded metadata is left unchanged and only the file dates are set")
+	}
 }
 
 // Runs a command with the persistent exiftool instance and returns its output lines.

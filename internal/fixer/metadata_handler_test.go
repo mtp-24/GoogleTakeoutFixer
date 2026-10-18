@@ -61,3 +61,23 @@ func TestPhotoLocation(t *testing.T) {
 		}
 	}
 }
+
+func TestLocationHelpers(t *testing.T) {
+	if d := distanceMetres(-27.4433722, 153.0805055, -27.4434, 153.0805); d < 1 || d > 15 {
+		t.Errorf("rounding to four decimals should be a few metres, got %.1f m", d)
+	}
+	if d := distanceMetres(-33.8, 151.2, -37.8, 144.9); d < 500000 {
+		t.Errorf("Sydney to Melbourne should be hundreds of km, got %.0f m", d)
+	}
+	lat, lon, ok := locationFromSnapshot(map[string]string{"GPS:GPSLatitude": "27.4433722222222", "GPS:GPSLatitudeRef": "S", "GPS:GPSLongitude": "153.080505555556", "GPS:GPSLongitudeRef": "E"})
+	if !ok || lat > 0 || lon < 0 {
+		t.Errorf("EXIF location = %f, %f, %v; want southern latitude, eastern longitude", lat, lon, ok)
+	}
+	lat, lon, ok = locationFromSnapshot(map[string]string{"Keys:GPSCoordinates": "-27.4005 153.0881 2.053"})
+	if !ok || lat != -27.4005 || lon != 153.0881 {
+		t.Errorf("QuickTime location = %f, %f, %v", lat, lon, ok)
+	}
+	if _, _, ok := locationFromSnapshot(map[string]string{"GPS:GPSLatitude": "1"}); ok {
+		t.Errorf("a lone latitude is not a location")
+	}
+}

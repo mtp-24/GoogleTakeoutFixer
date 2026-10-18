@@ -6,3 +6,6 @@
 .DS_Store
 .directory
 logs/
+# Local build of the app
+/GoogleTakeoutFixer
+/GoogleTakeoutFixer.exe
