@@ -46,12 +46,42 @@ func Main() {
 	monthSubfolders := flag.Bool("month-subfolders", false, "Create month subfolders (1-12) inside year folders")
 	flatten := flag.Bool("flatten", false, "Put all media files directly in the output folder without year/album subfolders")
 	restoreMOV := flag.Bool("restore-mov", false, "Restore .MOV file extension in case the Major Brand EXIF field says \"Apple QuickTime (.MOV/QT)\"")
+	dryRun := flag.Bool("dry-run", false, "Log what would be done without copying or modifying any files")
+	skipBin := flag.Bool("skip-bin", false, "Do not export deleted photos from the Bin/Trash folder")
+	organize := flag.Bool("organize", false, "Move the files of all takeout archives in --input into one folder structure in --output (same drive, no copies, no content changes). Writes a journal for --undo")
+	inPlace := flag.Bool("in-place", false, "Write the metadata into the files in --input where they are, without copying them. Writes a journal for --undo")
+	keepBackups := flag.Bool("keep-backups", false, "With --in-place: keep exiftool's \"_original\" copies so --undo restores the exact original files (needs disk space)")
+	undo := flag.String("undo", "", "Undo a previous --organize or --in-place run using its journal file")
 
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(version.Tag)
 		return
+	}
+
+	if *undo != "" {
+		if err := fixer.Undo(*undo); err != nil {
+			fmt.Printf("Error during undo: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *organize && *inPlace {
+		fmt.Println("Error: --organize and --in-place cannot be used together, run them one after the other")
+		os.Exit(1)
+	}
+	if *inPlace && (*useSymlinks || *flatten || *monthSubfolders) {
+		fmt.Println("Error: --in-place cannot be combined with --symlink, --flatten or --month-subfolders, use --organize for those")
+		os.Exit(1)
+	}
+	if *organize && *useSymlinks {
+		fmt.Println("Error: --organize and --symlink cannot be used together")
+		os.Exit(1)
+	}
+	if *keepBackups && !*inPlace {
+		fmt.Println("Error: --keep-backups only applies to --in-place")
+		os.Exit(1)
 	}
 
 	if *flatten && *useSymlinks {
@@ -71,7 +101,7 @@ func Main() {
 		os.Exit(1)
 	}
 
-	if *inputPath == "" || *outputPath == "" {
+	if *inputPath == "" || (*outputPath == "" && !*inPlace) {
 		fmt.Println("Error: --input and --output are required")
 		flag.Usage()
 		os.Exit(1)
@@ -86,11 +116,22 @@ func Main() {
 		IgnoreAlbums:        *ignoreAlbums,
 		MonthSubfolders:     *monthSubfolders,
 		RestoreMOVExtension: *restoreMOV,
+		DryRun:              *dryRun,
+		SkipBin:             *skipBin,
+		KeepBackups:         *keepBackups,
 	}
 
 	go func() {
-		// Invert skipMetadata because the flag is named skipMetadata but the process function expects writeMetadata
-		if err := fixer.Process(context.Background(), *inputPath, *outputPath, progressCh, options); err != nil {
+		var err error
+		switch {
+		case *organize:
+			err = fixer.Organize(context.Background(), *inputPath, *outputPath, progressCh, options)
+		case *inPlace:
+			err = fixer.ProcessInPlace(context.Background(), *inputPath, progressCh, options)
+		default:
+			err = fixer.Process(context.Background(), *inputPath, *outputPath, progressCh, options)
+		}
+		if err != nil {
 			fmt.Printf("Error during processing: %v\n", err)
 		}
 	}()

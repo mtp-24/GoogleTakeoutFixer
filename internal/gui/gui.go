@@ -31,6 +31,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/feloex/GoogleTakeoutFixer/internal/fixer"
@@ -53,6 +54,11 @@ func Main() {
 	var ignoreAlbums bool = false
 	var monthSubfolders bool = false
 	var restoreMOVExtension bool = false
+	var dryRun bool = false
+	var skipBin bool = false
+	var organize bool = false
+	var inPlace bool = false
+	var keepBackups bool = false
 
 	progressLabel := widget.NewLabel("Ready to start")
 	progressLabel.Truncation = fyne.TextTruncateEllipsis
@@ -143,6 +149,35 @@ func Main() {
 		fmt.Println("restore MOV extension", restoreMOVExtension)
 	})
 
+	dryRunCheckbox := widget.NewCheck("Dry run (no changes)", func(value bool) {
+		dryRun = value
+		fmt.Println("dry run", dryRun)
+	})
+
+	skipBinCheckbox := widget.NewCheck("Skip Bin (deleted photos)", func(value bool) {
+		skipBin = value
+		fmt.Println("skip bin", skipBin)
+	})
+
+	// Modes that change the input instead of copying it. Both write a journal that "Undo last run" replays
+	organizeCheckbox := widget.NewCheck("Consolidate takeouts by moving files (no copies)", func(value bool) {
+		organize = value
+		fmt.Println("organize", organize)
+	})
+
+	inPlaceCheckbox := widget.NewCheck("Fix files in place (no copies)", func(value bool) {
+		inPlace = value
+		fmt.Println("in place", inPlace)
+	})
+
+	keepBackupsCheckbox := widget.NewCheck("Keep backup copies for a byte-exact undo (needs disk space)", func(value bool) {
+		keepBackups = value
+		fmt.Println("keep backups", keepBackups)
+	})
+	keepBackupsCheckbox.Disable()
+
+	var undoButton *widget.Button
+
 	// Fix conflicting options
 	updateCheckboxStates := func() {
 		setEnabled := func(cb *widget.Check, enabled bool) {
@@ -152,13 +187,23 @@ func Main() {
 				cb.Disable()
 			}
 		}
-		setEnabled(useLinksCheckbox, !ignoreAlbums && !flatten)
+		setEnabled(useLinksCheckbox, !ignoreAlbums && !flatten && !organize && !inPlace)
 		setEnabled(ignoreAlbumsCheckbox, !useSymlinks && !flatten)
-		setEnabled(flattenCheckbox, !useSymlinks && !ignoreAlbums && !monthSubfolders)
-		setEnabled(monthSubfoldersCheckbox, !flatten)
+		setEnabled(flattenCheckbox, !useSymlinks && !ignoreAlbums && !monthSubfolders && !inPlace)
+		setEnabled(monthSubfoldersCheckbox, !flatten && !inPlace)
+		setEnabled(organizeCheckbox, !inPlace && !useSymlinks)
+		setEnabled(inPlaceCheckbox, !organize && !useSymlinks && !flatten && !monthSubfolders)
+		setEnabled(keepBackupsCheckbox, inPlace)
+		setEnabled(writeMetadataCheckbox, !organize)
+		// Fixing in place needs no output folder
+		if inPlace {
+			outputButton.Disable()
+		} else {
+			outputButton.Enable()
+		}
 	}
 
-	for _, cb := range []*widget.Check{useLinksCheckbox, ignoreAlbumsCheckbox, flattenCheckbox, monthSubfoldersCheckbox} {
+	for _, cb := range []*widget.Check{useLinksCheckbox, ignoreAlbumsCheckbox, flattenCheckbox, monthSubfoldersCheckbox, organizeCheckbox, inPlaceCheckbox} {
 		cb := cb
 		prev := cb.OnChanged
 		cb.OnChanged = func(v bool) {
@@ -171,7 +216,7 @@ func Main() {
 	var startButton *widget.Button
 	startButton = widget.NewButtonWithIcon("Start Processing", theme.MediaPlayIcon(), func() {
 		// one of the folders has not been selected
-		if inputPath == "" || outputPath == "" {
+		if inputPath == "" || (outputPath == "" && !inPlace) {
 			fixer.Log(fixer.LoggerInfo, "Select both input and output folders")
 			return
 		}
@@ -187,6 +232,12 @@ func Main() {
 		monthSubfoldersCheckbox.Disable()
 		flattenCheckbox.Disable()
 		restoreMOVExtensionCheckbox.Disable()
+		dryRunCheckbox.Disable()
+		skipBinCheckbox.Disable()
+		organizeCheckbox.Disable()
+		inPlaceCheckbox.Disable()
+		keepBackupsCheckbox.Disable()
+		undoButton.Disable()
 
 		fixer.Log(fixer.LoggerInfo, "Processing...")
 		progressBar.SetValue(0)
@@ -204,9 +255,21 @@ func Main() {
 			IgnoreAlbums:        ignoreAlbums,
 			MonthSubfolders:     monthSubfolders,
 			RestoreMOVExtension: restoreMOVExtension,
+			DryRun:              dryRun,
+			SkipBin:             skipBin,
+			KeepBackups:         keepBackups,
 		}
 		go func() {
-			if err := fixer.Process(ctx, inputPath, outputPath, progressCh, opts); err != nil {
+			var err error
+			switch {
+			case organize:
+				err = fixer.Organize(ctx, inputPath, outputPath, progressCh, opts)
+			case inPlace:
+				err = fixer.ProcessInPlace(ctx, inputPath, progressCh, opts)
+			default:
+				err = fixer.Process(ctx, inputPath, outputPath, progressCh, opts)
+			}
+			if err != nil {
 				if ctx.Err() == nil {
 					fyne.Do(func() {
 						fixer.Log(fixer.LoggerError, "%s", "Error: "+err.Error())
@@ -253,11 +316,15 @@ func Main() {
 					fixer.Log(fixer.LoggerInfo, "Cancelled")
 					progressLabel.SetText("Cancelled")
 				} else {
-					fixer.Log(fixer.LoggerInfo, "Detailed logs are saved in the ./logs folder")
+					fixer.Log(fixer.LoggerInfo, "Detailed logs are saved in %s", fixer.LogDirectory())
 					fixer.Log(fixer.LoggerInfo, "Done")
 
-					progressLabel.SetText(fmt.Sprintf("Finished processing %d files", lastP.Processed))
-					fixer.Log(fixer.LoggerInfo, "%s", fmt.Sprintf("Finished processing %d files", lastP.Processed))
+					finishedText := fmt.Sprintf("Finished processing %d files", lastP.Processed)
+					if opts.DryRun {
+						finishedText = fmt.Sprintf("Dry run finished, %d files checked and nothing was changed", lastP.Processed)
+					}
+					progressLabel.SetText(finishedText)
+					fixer.Log(fixer.LoggerInfo, "%s", finishedText)
 				}
 				cancelButton.Disable()
 				cancelFn = nil
@@ -265,10 +332,13 @@ func Main() {
 				outputButton.Enable()
 				startButton.Enable()
 
-				// Manually re-enable restoreMOVExtensionCheckbox and writeMetadataCheckbox
-				// since they are not affected by other checboxes in updateCheckboxStates
+				// Manually re-enable checkboxes not affected by updateCheckboxStates
 				restoreMOVExtensionCheckbox.Enable()
-				writeMetadataCheckbox.Enable()
+				dryRunCheckbox.Enable()
+				skipBinCheckbox.Enable()
+				if fixer.LastJournalPath() != "" {
+					undoButton.Enable()
+				}
 				// Re-enable checboxes based on current states
 				updateCheckboxStates()
 			})
@@ -284,6 +354,34 @@ func Main() {
 		cancelFn()
 	})
 	cancelButton.Disable()
+
+	// Undoes the last run that moved files or changed metadata, using its journal
+	undoButton = widget.NewButtonWithIcon("Undo last run", theme.ContentUndoIcon(), func() {
+		journalPath := fixer.LastJournalPath()
+		if journalPath == "" {
+			return
+		}
+		dialog.ShowConfirm("Undo last run", "Move all files back and restore the metadata recorded in\n"+journalPath+"?", func(confirmed bool) {
+			if !confirmed {
+				return
+			}
+			undoButton.Disable()
+			startButton.Disable()
+			go func() {
+				err := fixer.Undo(journalPath)
+				fyne.Do(func() {
+					if err != nil {
+						fixer.Log(fixer.LoggerError, "Undo failed: %v", err)
+						undoButton.Enable()
+					} else {
+						progressLabel.SetText("Undo finished")
+					}
+					startButton.Enable()
+				})
+			}()
+		}, w)
+	})
+	undoButton.Disable()
 
 	logEntry := widget.NewMultiLineEntry()
 	const maxVisibleLogLines = 200
@@ -352,9 +450,14 @@ func Main() {
 		monthSubfoldersCheckbox,
 		flattenCheckbox,
 		restoreMOVExtensionCheckbox,
+		skipBinCheckbox,
+		dryRunCheckbox,
+		organizeCheckbox,
+		inPlaceCheckbox,
+		keepBackupsCheckbox,
 	)
 
-	StartCancelRow := container.NewGridWithColumns(2, startButton, cancelButton)
+	StartCancelRow := container.NewGridWithColumns(3, startButton, cancelButton, undoButton)
 
 	separator := canvas.NewRectangle(color.RGBA{R: 60, G: 60, B: 60, A: 100})
 	separator.SetMinSize(fyne.NewSize(1, 1))
